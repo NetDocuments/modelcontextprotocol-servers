@@ -12,6 +12,12 @@ import {
 interface ListChannelsArgs {
   limit?: number;
   cursor?: string;
+  types?: string;
+}
+
+interface FindChannelsByNameArgs {
+  names: string[];
+  include_private?: boolean;
 }
 
 interface PostMessageArgs {
@@ -53,7 +59,7 @@ interface GetUserProfileArgs {
 // Tool definitions
 const listChannelsTool: Tool = {
   name: "slack_list_channels",
-  description: "List public channels in the workspace with pagination",
+  description: "List public and private channels in the workspace with pagination",
   inputSchema: {
     type: "object",
     properties: {
@@ -67,7 +73,35 @@ const listChannelsTool: Tool = {
         type: "string",
         description: "Pagination cursor for next page of results",
       },
+      types: {
+        type: "string",
+        description: "Comma-separated list of channel types to include: public_channel,private_channel",
+        default: "public_channel",
+      },
     },
+  },
+};
+
+const findChannelsByNameTool: Tool = {
+  name: "slack_find_channels_by_name",
+  description: "Find channel IDs by their names, processing multiple channels in a single request",
+  inputSchema: {
+    type: "object",
+    properties: {
+      names: {
+        type: "array",
+        items: {
+          type: "string"
+        },
+        description: "Array of channel names to find (without the # symbol)",
+      },
+      include_private: {
+        type: "boolean",
+        description: "Whether to include private channels in the search",
+        default: false,
+      }
+    },
+    required: ["names"],
   },
 };
 
@@ -220,9 +254,9 @@ class SlackClient {
     };
   }
 
-  async getChannels(limit: number = 100, cursor?: string): Promise<any> {
+  async getChannels(limit: number = 100, cursor?: string, types: string = "public_channel"): Promise<any> {
     const params = new URLSearchParams({
-      types: "public_channel",
+      types: types,
       exclude_archived: "true",
       limit: Math.min(limit, 200).toString(),
       team_id: process.env.SLACK_TEAM_ID!,
@@ -238,6 +272,77 @@ class SlackClient {
     );
 
     return response.json();
+  }
+
+  async findChannelsByName(names: string[], include_private: boolean = false): Promise<any> {
+    const types = include_private
+      ? "public_channel,private_channel"
+      : "public_channel";
+
+    // Create a map to store all channels
+    const allChannels: any[] = [];
+    let cursor: string | undefined = undefined;
+    let hasMore = true;
+
+    // Paginate through all channels
+    while (hasMore) {
+      const channelsResponse = await this.getChannels(1000, cursor, types);
+
+      if (!channelsResponse.ok) {
+        return channelsResponse;
+      }
+
+      // Add channels to our collection
+      if (channelsResponse.channels && Array.isArray(channelsResponse.channels)) {
+        allChannels.push(...channelsResponse.channels);
+      }
+
+      // Check if there are more pages
+      if (channelsResponse.response_metadata &&
+        channelsResponse.response_metadata.next_cursor &&
+        channelsResponse.response_metadata.next_cursor.trim() !== '') {
+        cursor = channelsResponse.response_metadata.next_cursor;
+      } else {
+        hasMore = false;
+      }
+    }
+
+    // Create a lookup map of name -> channel
+    const channelMap = new Map();
+    allChannels.forEach((channel: any) => {
+      channelMap.set(channel.name, channel);
+    });
+
+    // Find matching channels
+    const results: { [name: string]: any } = {};
+    const found: any[] = [];
+    const notFound: string[] = [];
+
+    names.forEach(name => {
+      if (channelMap.has(name)) {
+        const channel = channelMap.get(name);
+        results[name] = {
+          id: channel.id,
+          name: channel.name,
+          is_private: channel.is_private,
+          is_channel: channel.is_channel,
+          created: channel.created
+        };
+        found.push(channel);
+      } else {
+        notFound.push(name);
+      }
+    });
+
+    return {
+      ok: true,
+      total_channels_searched: allChannels.length,
+      found_count: found.length,
+      not_found_count: notFound.length,
+      channels: found,
+      not_found: notFound,
+      results: results
+    };
   }
 
   async postMessage(channel_id: string, text: string): Promise<any> {
@@ -389,11 +494,25 @@ async function main() {
 
         switch (request.params.name) {
           case "slack_list_channels": {
-            const args = request.params
-              .arguments as unknown as ListChannelsArgs;
+            const args = request.params.arguments as unknown as ListChannelsArgs;
             const response = await slackClient.getChannels(
               args.limit,
               args.cursor,
+              args.types
+            );
+            return {
+              content: [{ type: "text", text: JSON.stringify(response) }],
+            };
+          }
+
+          case "slack_find_channels_by_name": {
+            const args = request.params.arguments as unknown as FindChannelsByNameArgs;
+            if (!args.names || !Array.isArray(args.names) || args.names.length === 0) {
+              throw new Error("Missing or invalid required argument: names (should be a non-empty array)");
+            }
+            const response = await slackClient.findChannelsByName(
+              args.names,
+              args.include_private
             );
             return {
               content: [{ type: "text", text: JSON.stringify(response) }],
@@ -530,6 +649,7 @@ async function main() {
     return {
       tools: [
         listChannelsTool,
+        findChannelsByNameTool,
         postMessageTool,
         replyToThreadTool,
         addReactionTool,
