@@ -17,7 +17,7 @@ interface ListChannelsArgs {
 
 interface FindChannelsByNameArgs {
   names: string[];
-  include_private?: boolean;
+  types?: string;  // Changed from include_private to types
 }
 
 interface PostMessageArgs {
@@ -54,6 +54,21 @@ interface GetUsersArgs {
 
 interface GetUserProfileArgs {
   user_id: string;
+}
+
+interface FindUsersByNameArgs {
+  query: string;
+  limit?: number;
+}
+
+interface FindUsersByEmailArgs {
+  email: string;
+}
+
+interface FindUsersByAttributeArgs {
+  attribute: string;
+  value: string;
+  limit?: number;
 }
 
 // Tool definitions
@@ -95,10 +110,10 @@ const findChannelsByNameTool: Tool = {
         },
         description: "Array of channel names to find (without the # symbol)",
       },
-      include_private: {
-        type: "boolean",
-        description: "Whether to include private channels in the search",
-        default: false,
+      types: {
+        type: "string",
+        description: "Comma-separated list of channel types to include: public_channel,private_channel,mpim,im",
+        default: "public_channel",
       }
     },
     required: ["names"],
@@ -244,6 +259,65 @@ const getUserProfileTool: Tool = {
   },
 };
 
+const findUsersByNameTool: Tool = {
+  name: "slack_find_users_by_name",
+  description: "Find users by their display name or real name",
+  inputSchema: {
+    type: "object",
+    properties: {
+      query: {
+        type: "string",
+        description: "The name or partial name to search for (case insensitive)",
+      },
+      limit: {
+        type: "number",
+        description: "Maximum number of matching users to return",
+        default: 10,
+      },
+    },
+    required: ["query"],
+  },
+};
+
+const findUsersByEmailTool: Tool = {
+  name: "slack_find_users_by_email",
+  description: "Find a user by their email address",
+  inputSchema: {
+    type: "object",
+    properties: {
+      email: {
+        type: "string",
+        description: "The email address to search for (exact match)",
+      },
+    },
+    required: ["email"],
+  },
+};
+
+const findUsersByAttributeTool: Tool = {
+  name: "slack_find_users_by_attribute",
+  description: "Find users by a specific profile attribute",
+  inputSchema: {
+    type: "object",
+    properties: {
+      attribute: {
+        type: "string",
+        description: "The profile attribute to search (e.g., 'title', 'phone', 'status_text')",
+      },
+      value: {
+        type: "string",
+        description: "The value to search for (case insensitive partial match)",
+      },
+      limit: {
+        type: "number",
+        description: "Maximum number of matching users to return",
+        default: 10,
+      },
+    },
+    required: ["attribute", "value"],
+  },
+};
+
 class SlackClient {
   private botHeaders: { Authorization: string; "Content-Type": string };
 
@@ -274,69 +348,89 @@ class SlackClient {
     return response.json();
   }
 
-  async findChannelsByName(names: string[], include_private: boolean = false): Promise<any> {
-    const types = include_private
-      ? "public_channel,private_channel"
-      : "public_channel";
 
-    // Create a map to store all channels
-    const allChannels: any[] = [];
+
+  async findChannelsByName(names: string[], types: string = "public_channel"): Promise<any> {
+    // Helper function to sleep for a specified amount of time
+    const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+    // Create a set of names we're looking for (for O(1) lookups)
+    const nameSet = new Set(names);
+    const remainingNames = new Set(names);
+
+    // Track results
+    const found: any[] = [];
+    const results: { [name: string]: any } = {};
+    let totalChannelsSearched = 0;
+
+    // Paginate through channels until we find all requested channels or exhaust the list
     let cursor: string | undefined = undefined;
-    let hasMore = true;
+    let pageCount = 0;
 
-    // Paginate through all channels
-    while (hasMore) {
+    while (remainingNames.size > 0) {
+      // Add a random pause between requests (except for the first request)
+      if (pageCount > 0) {
+        const pauseTime = Math.floor(Math.random() * 750) + 250; // Random time between 250ms and 1000ms
+        await sleep(pauseTime);
+      }
+
+      pageCount++;
+
       const channelsResponse = await this.getChannels(1000, cursor, types);
 
       if (!channelsResponse.ok) {
         return channelsResponse;
       }
 
-      // Add channels to our collection
+      // Process channels in this page
       if (channelsResponse.channels && Array.isArray(channelsResponse.channels)) {
-        allChannels.push(...channelsResponse.channels);
+        totalChannelsSearched += channelsResponse.channels.length;
+
+        // Check each channel against our remaining names
+        for (const channel of channelsResponse.channels) {
+          if (remainingNames.has(channel.name)) {
+            // Found a match!
+            results[channel.name] = {
+              id: channel.id,
+              name: channel.name,
+              is_private: channel.is_private,
+              is_channel: channel.is_channel,
+              is_im: channel.is_im,
+              is_mpim: channel.is_mpim,
+              created: channel.created
+            };
+            found.push(channel);
+            remainingNames.delete(channel.name);
+
+            // If we've found all channels, we can stop searching
+            if (remainingNames.size === 0) {
+              break;
+            }
+          }
+        }
       }
 
-      // Check if there are more pages
-      if (channelsResponse.response_metadata &&
+      // Check if we need to continue pagination
+      const hasNextPage = channelsResponse.response_metadata &&
         channelsResponse.response_metadata.next_cursor &&
-        channelsResponse.response_metadata.next_cursor.trim() !== '') {
-        cursor = channelsResponse.response_metadata.next_cursor;
-      } else {
-        hasMore = false;
+        channelsResponse.response_metadata.next_cursor.trim() !== '';
+
+      // Stop if we've either found all channels or there are no more pages
+      if (remainingNames.size === 0 || !hasNextPage) {
+        break;
       }
+
+      // Get the next page
+      cursor = channelsResponse.response_metadata.next_cursor;
     }
 
-    // Create a lookup map of name -> channel
-    const channelMap = new Map();
-    allChannels.forEach((channel: any) => {
-      channelMap.set(channel.name, channel);
-    });
-
-    // Find matching channels
-    const results: { [name: string]: any } = {};
-    const found: any[] = [];
-    const notFound: string[] = [];
-
-    names.forEach(name => {
-      if (channelMap.has(name)) {
-        const channel = channelMap.get(name);
-        results[name] = {
-          id: channel.id,
-          name: channel.name,
-          is_private: channel.is_private,
-          is_channel: channel.is_channel,
-          created: channel.created
-        };
-        found.push(channel);
-      } else {
-        notFound.push(name);
-      }
-    });
+    // Any names still in the set weren't found
+    const notFound = Array.from(remainingNames);
 
     return {
       ok: true,
-      total_channels_searched: allChannels.length,
+      total_channels_searched: totalChannelsSearched,
+      pages_searched: pageCount,
       found_count: found.length,
       not_found_count: notFound.length,
       channels: found,
@@ -455,7 +549,145 @@ class SlackClient {
 
     return response.json();
   }
+  async findUsersByName(query: string, limit: number = 10): Promise<any> {
+    // We'll need to get all users and filter
+    const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+    const allUsers: any[] = [];
+    let cursor: string | undefined = undefined;
+    const searchQuery = query.toLowerCase();
+    const matchingUsers: any[] = [];
+
+    // Keep fetching until we have enough matching users or run out of users
+    while (matchingUsers.length < limit) {
+      // Add a delay to avoid rate limiting, except for the first request
+      if (cursor) {
+        const pauseTime = Math.floor(Math.random() * 750) + 250;
+        await sleep(pauseTime);
+      }
+
+      const response = await this.getUsers(200, cursor);
+
+      if (!response.ok) {
+        return response;
+      }
+
+      if (!response.members || response.members.length === 0) {
+        break; // No more users to process
+      }
+
+      // Filter users by name
+      for (const user of response.members) {
+        const realName = (user.real_name || '').toLowerCase();
+        const displayName = (user.profile?.display_name || '').toLowerCase();
+        const userName = (user.name || '').toLowerCase();
+
+        if (realName.includes(searchQuery) ||
+          displayName.includes(searchQuery) ||
+          userName.includes(searchQuery)) {
+          matchingUsers.push(user);
+
+          if (matchingUsers.length >= limit) {
+            break;
+          }
+        }
+      }
+
+      // Check if we need to continue pagination
+      if (response.response_metadata?.next_cursor) {
+        cursor = response.response_metadata.next_cursor;
+      } else {
+        break; // No more pages
+      }
+    }
+
+    return {
+      ok: true,
+      users: matchingUsers,
+      count: matchingUsers.length
+    };
+  }
+
+  async findUsersByEmail(email: string): Promise<any> {
+    const params = new URLSearchParams({
+      email: email
+    });
+
+    const response = await fetch(
+      `https://slack.com/api/users.lookupByEmail?${params}`,
+      { headers: this.botHeaders }
+    );
+
+    return response.json();
+  }
+
+  async findUsersByAttribute(attribute: string, value: string, limit: number = 10): Promise<any> {
+    // We'll need to get all users and filter
+    const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+    const allUsers: any[] = [];
+    let cursor: string | undefined = undefined;
+    const searchValue = value.toLowerCase();
+    const matchingUsers: any[] = [];
+
+    // Keep fetching until we have enough matching users or run out of users
+    while (matchingUsers.length < limit) {
+      // Add a delay to avoid rate limiting, except for the first request
+      if (cursor) {
+        const pauseTime = Math.floor(Math.random() * 750) + 250;
+        await sleep(pauseTime);
+      }
+
+      const response = await this.getUsers(200, cursor);
+
+      if (!response.ok) {
+        return response;
+      }
+
+      if (!response.members || response.members.length === 0) {
+        break; // No more users to process
+      }
+
+      // Filter users by the specified attribute
+      for (const user of response.members) {
+        let attributeValue: string | undefined;
+
+        // Check in profile
+        if (user.profile && Object.prototype.hasOwnProperty.call(user.profile, attribute)) {
+          attributeValue = String(user.profile[attribute]);
+        }
+        // Check in user object itself
+        else if (Object.prototype.hasOwnProperty.call(user, attribute)) {
+          attributeValue = String(user[attribute]);
+        }
+
+        if (attributeValue && attributeValue.toLowerCase().includes(searchValue)) {
+          matchingUsers.push(user);
+
+          if (matchingUsers.length >= limit) {
+            break;
+          }
+        }
+      }
+
+      // Check if we need to continue pagination
+      if (response.response_metadata?.next_cursor) {
+        cursor = response.response_metadata.next_cursor;
+      } else {
+        break; // No more pages
+      }
+    }
+
+    return {
+      ok: true,
+      users: matchingUsers,
+      count: matchingUsers.length
+    };
+  }
+
 }
+
+
 
 async function main() {
   const botToken = process.env.SLACK_BOT_TOKEN;
@@ -512,7 +744,7 @@ async function main() {
             }
             const response = await slackClient.findChannelsByName(
               args.names,
-              args.include_private
+              args.types
             );
             return {
               content: [{ type: "text", text: JSON.stringify(response) }],
@@ -625,6 +857,46 @@ async function main() {
             };
           }
 
+          case "slack_find_users_by_name": {
+            const args = request.params.arguments as unknown as FindUsersByNameArgs;
+            if (!args.query) {
+              throw new Error("Missing required argument: query");
+            }
+            const response = await slackClient.findUsersByName(
+              args.query,
+              args.limit
+            );
+            return {
+              content: [{ type: "text", text: JSON.stringify(response) }],
+            };
+          }
+
+          case "slack_find_users_by_email": {
+            const args = request.params.arguments as unknown as FindUsersByEmailArgs;
+            if (!args.email) {
+              throw new Error("Missing required argument: email");
+            }
+            const response = await slackClient.findUsersByEmail(args.email);
+            return {
+              content: [{ type: "text", text: JSON.stringify(response) }],
+            };
+          }
+
+          case "slack_find_users_by_attribute": {
+            const args = request.params.arguments as unknown as FindUsersByAttributeArgs;
+            if (!args.attribute || !args.value) {
+              throw new Error("Missing required arguments: attribute and value");
+            }
+            const response = await slackClient.findUsersByAttribute(
+              args.attribute,
+              args.value,
+              args.limit
+            );
+            return {
+              content: [{ type: "text", text: JSON.stringify(response) }],
+            };
+          }
+
           default:
             throw new Error(`Unknown tool: ${request.params.name}`);
         }
@@ -657,6 +929,9 @@ async function main() {
         getThreadRepliesTool,
         getUsersTool,
         getUserProfileTool,
+        findUsersByNameTool,
+        findUsersByEmailTool,
+        findUsersByAttributeTool,
       ],
     };
   });
