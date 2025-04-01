@@ -71,6 +71,12 @@ interface FindUsersByAttributeArgs {
   limit?: number;
 }
 
+interface ScheduleMessageArgs {
+  channel_id: string;
+  text: string;
+  post_at: number; // Unix timestamp for when to post the message
+}
+
 // Tool definitions
 const listChannelsTool: Tool = {
   name: "slack_list_channels",
@@ -315,6 +321,29 @@ const findUsersByAttributeTool: Tool = {
       },
     },
     required: ["attribute", "value"],
+  },
+};
+
+const scheduleMessageTool: Tool = {
+  name: "slack_schedule_message",
+  description: "Schedule a message to be posted to a Slack channel at a future time",
+  inputSchema: {
+    type: "object",
+    properties: {
+      channel_id: {
+        type: "string",
+        description: "The ID of the channel to post to",
+      },
+      text: {
+        type: "string",
+        description: "The message text to post",
+      },
+      post_at: {
+        type: "number",
+        description: "Unix timestamp (in seconds) for when to post the message (up to 120 days in the future)",
+      },
+    },
+    required: ["channel_id", "text", "post_at"],
   },
 };
 
@@ -685,6 +714,20 @@ class SlackClient {
     };
   }
 
+  async scheduleMessage(channel_id: string, text: string, post_at: number): Promise<any> {
+    const response = await fetch("https://slack.com/api/chat.scheduleMessage", {
+      method: "POST",
+      headers: this.botHeaders,
+      body: JSON.stringify({
+        channel: channel_id,
+        text: text,
+        post_at: post_at,
+      }),
+    });
+
+    return response.json();
+  }
+
 }
 
 
@@ -897,6 +940,23 @@ async function main() {
             };
           }
 
+          case "slack_schedule_message": {
+            const args = request.params.arguments as unknown as ScheduleMessageArgs;
+            if (!args.channel_id || !args.text || args.post_at === undefined) {
+              throw new Error(
+                "Missing required arguments: channel_id, text, and post_at",
+              );
+            }
+            const response = await slackClient.scheduleMessage(
+              args.channel_id,
+              args.text,
+              args.post_at,
+            );
+            return {
+              content: [{ type: "text", text: JSON.stringify(response) }],
+            };
+          }
+
           default:
             throw new Error(`Unknown tool: ${request.params.name}`);
         }
@@ -932,6 +992,7 @@ async function main() {
         findUsersByNameTool,
         findUsersByEmailTool,
         findUsersByAttributeTool,
+        scheduleMessageTool,
       ],
     };
   });
